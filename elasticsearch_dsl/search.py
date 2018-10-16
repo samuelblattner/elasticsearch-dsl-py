@@ -708,6 +708,7 @@ class Search(Request):
                 query=self.to_dict(),
                 index=self._index,
                 doc_type=self._get_doc_type(),
+                track_score=True,
                 **self._params
         ):
             yield self._get_result(hit)
