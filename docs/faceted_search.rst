@@ -21,7 +21,7 @@ declaring a ``FacetedSearch`` subclass:
   the name of the index (as string) to search through, defaults to ``'_all'``.
 
 ``doc_types``
-  list of ``DocType`` subclasses or strings to be used, defaults to
+  list of ``Document`` subclasses or strings to be used, defaults to
   ``['_all']``.
 
 ``fields``
@@ -36,7 +36,7 @@ declaring a ``FacetedSearch`` subclass:
 
 ``sort``
   tuple or list of fields on which the results should be sorted. The format of
-  the individual fieldsa re to be the same as those passed to
+  the individual fields are to be the same as those passed to
   :meth:`~elasticsearch_dsl.Search.sort`.
 
 
@@ -57,6 +57,19 @@ There are several different facets available:
 ``RangeFacet``
   allows you to define your own ranges for a numerical fields:
   ``RangeFacet(field="comment_count", ranges=[("few", (None, 2)), ("lots", (2, None))])``
+
+``NestedFacet``
+  is just a simple facet that wraps another to provide access to nested documents:
+  ``NestedFacet('variants', TermsFacet(field='variants.color'))``
+
+
+By default facet results will only calculate document count, if you wish for
+a different metric you can pass in any single value metric aggregation as the
+``metric`` kwarg (``TermsFacet(field='tags', metric=A('max',
+field=timestamp))``). When specifying ``metric`` the results will be, by
+default, sorted in descending order by that metric. To change it to ascending
+specify ``metric_sort="asc"`` and to just sort by document count use
+``metric_sort=False``.
 
 Advanced
 ~~~~~~~~

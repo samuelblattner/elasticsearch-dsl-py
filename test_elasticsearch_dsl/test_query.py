@@ -52,7 +52,6 @@ def test_query_clone():
 
     assert bool == bool_clone
     assert bool is not bool_clone
-    assert bool.must[0] is not bool_clone.must[0]
 
 def test_bool_converts_its_init_args_to_queries():
     q = query.Bool(must=[{"match": {"f": "value"}}])
@@ -98,6 +97,21 @@ def test_bool_and_other_sets_min_should_match_if_needed():
         minimum_should_match=1
     )
 
+def test_bool_with_different_minimum_should_match_should_not_be_combined():
+    q1 = query.Q('bool', minimum_should_match=2, should=[query.Q('term', field='aa1'), query.Q('term', field='aa2'), query.Q('term', field='aa3'), query.Q('term', field='aa4')])
+    q2 = query.Q('bool', minimum_should_match=3, should=[query.Q('term', field='bb1'), query.Q('term', field='bb2'), query.Q('term', field='bb3'), query.Q('term', field='bb4')])
+    q3 = query.Q('bool', minimum_should_match=4, should=[query.Q('term', field='cc1'), query.Q('term', field='cc2'), query.Q('term', field='cc3'), query.Q('term', field='cc4')])
+
+    q4 = q1 | q2
+    assert q4 == query.Bool(
+        should=[q1, q2]
+    )
+
+    q5 = q1 | q2 | q3
+    assert q5 == query.Bool(
+        should=[q1, q2, q3]
+    )
+
 def test_empty_bool_has_min_should_match_0():
     assert 0 == query.Bool()._min_should_match
 
@@ -116,6 +130,28 @@ def test_match_all_and_query_equals_other():
     q = q1 & q2
     assert q1 == q
 
+def test_not_match_all_is_match_none():
+    q = query.MatchAll()
+
+    assert ~q == query.MatchNone()
+
+def test_not_match_none_is_match_all():
+    q = query.MatchNone()
+
+    assert ~q == query.MatchAll()
+
+def test_match_none_or_query_equals_query():
+    q1 = query.Match(f=42)
+    q2 = query.MatchNone()
+
+    assert q1 | q2 == query.Match(f=42)
+
+def test_match_none_and_query_equals_match_none():
+    q1 = query.Match(f=42)
+    q2 = query.MatchNone()
+
+    assert q1 & q2 == query.MatchNone()
+
 def test_bool_and_bool():
     qt1, qt2, qt3 = query.Match(f=1), query.Match(f=2), query.Match(f=3)
 
@@ -126,6 +162,13 @@ def test_bool_and_bool():
     q1 = query.Bool(must=[qt1], should=[qt1, qt2])
     q2 = query.Bool(should=[qt3])
     assert q1 & q2 == query.Bool(must=[qt1, qt3], should=[qt1, qt2], minimum_should_match=0)
+
+def test_bool_and_bool_with_min_should_match():
+    qt1, qt2 = query.Match(f=1), query.Match(f=2)
+    q1 = query.Q('bool', minimum_should_match=1, should=[qt1])
+    q2 = query.Q('bool', minimum_should_match=1, should=[qt2])
+
+    assert query.Q('bool', must=[qt1, qt2]) == q1 & q2
 
 def test_inverted_query_becomes_bool_with_must_not():
     q = query.Match(f=42)

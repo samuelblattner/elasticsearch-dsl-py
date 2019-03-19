@@ -1,5 +1,9 @@
 import copy
-import collections
+
+try:
+    import collections.abc as collections_abc  # only works on python 3.3+
+except ImportError:
+    import collections as collections_abc
 
 from six import iteritems, string_types
 
@@ -80,7 +84,8 @@ class ProxyDescriptor(object):
 class AggsProxy(AggBase, DslBase):
     name = 'aggs'
     def __init__(self, search):
-        self._base = self._search = search
+        self._base = self
+        self._search = search
         self._params = {'aggs': {}}
 
     def to_dict(self):
@@ -100,7 +105,7 @@ class Request(object):
         self._doc_type_map = {}
         if isinstance(doc_type, (tuple, list)):
             self._doc_type.extend(doc_type)
-        elif isinstance(doc_type, collections.Mapping):
+        elif isinstance(doc_type, collections_abc.Mapping):
             self._doc_type.extend(doc_type.keys())
             self._doc_type_map.update(doc_type)
         elif doc_type:
@@ -171,18 +176,29 @@ class Request(object):
         """
         return list(set(dt._doc_type.name if hasattr(dt, '_doc_type') else dt for dt in self._doc_type))
 
-    def _resolve_nested(self, field, parent_class=None):
-        doc_class = Hit
-        if hasattr(parent_class, '_doc_type'):
-            nested_field = parent_class._doc_type.resolve_field(field)
+    def _resolve_field(self, path):
+        for dt in self._doc_type:
+            if not hasattr(dt, '_index'):
+                continue
+            field = dt._index.resolve_field(path)
+            if field is not None:
+                return field
 
+    def _resolve_nested(self, hit, parent_class=None):
+        doc_class = Hit
+        nested_field = None
+
+        nested_path = []
+        nesting = hit['_nested']
+        while nesting and 'field' in nesting:
+            nested_path.append(nesting['field'])
+            nesting = nesting.get('_nested')
+        nested_path = '.'.join(nested_path)
+
+        if hasattr(parent_class, '_index'):
+            nested_field = parent_class._index.resolve_field(nested_path)
         else:
-            for dt in self._doc_type:
-                if not hasattr(dt, '_doc_type'):
-                    continue
-                nested_field = dt._doc_type.resolve_field(field)
-                if nested_field is not None:
-                    break
+            nested_field = self._resolve_field(nested_path)
 
         if nested_field is not None:
             return nested_field._doc_class
@@ -194,14 +210,14 @@ class Request(object):
         dt = hit.get('_type')
 
         if '_nested' in hit:
-            doc_class = self._resolve_nested(hit['_nested']['field'], parent_class)
+            doc_class = self._resolve_nested(hit, parent_class)
 
         elif dt in self._doc_type_map:
             doc_class = self._doc_type_map[dt]
 
         else:
             for doc_type in self._doc_type:
-                if hasattr(doc_type, '_doc_type') and doc_type._doc_type.matches(hit):
+                if hasattr(doc_type, '_matches') and doc_type._matches(hit):
                     doc_class = doc_type
                     break
 
@@ -215,7 +231,7 @@ class Request(object):
     def doc_type(self, *doc_type, **kwargs):
         """
         Set the type to search through. You can supply a single value or
-        multiple. Values can be strings or subclasses of ``DocType``.
+        multiple. Values can be strings or subclasses of ``Document``.
 
         You can also pass in any keyword arguments, mapping a doc_type to a
         callback that should be used instead of the Hit class.
@@ -465,10 +481,10 @@ class Search(Request):
         """
         Selectively control how the _source field is returned.
 
-        :arg source: wildcard string, array of wildcards, or dictionary of includes and excludes
+        :arg fields: wildcard string, array of wildcards, or dictionary of includes and excludes
 
-        If ``source`` is None, the entire document will be returned for
-        each hit.  If source is a dictionary with keys of 'include' and/or
+        If ``fields`` is None, the entire document will be returned for
+        each hit.  If fields is a dictionary with keys of 'include' and/or
         'exclude' the fields will be either included or excluded appropriately.
 
         Calling this multiple times with the same named parameter will override the

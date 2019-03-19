@@ -3,6 +3,77 @@
 Changelog
 =========
 
+6.3.1 (2018-12-05)
+------------------
+
+* ``Analyzer.simulate`` now supports built-in analyzers
+* proper (de)serialization of the ``Range`` wrapper
+* Added ``search_analyzer`` to ``Completion`` field
+
+6.3.0 (2018-11-21)
+------------------
+
+* Fixed logic around defining a different ``doc_type`` name.
+* Added ``retry_on_conflict`` parameter to ``Document.update``.
+* fields defined on an index are now used to (de)serialize the data even when
+  not defined on a ``Document``
+* Allow ``Index.analyzer`` to construct the analyzer
+* Detect conflict in analyzer definitions when calling ``Index.analyzer``
+* Detect conflicting mappings when creating an index
+* Add ``simulate`` method to ``analyzer`` object to test the analyzer using the
+  ``_analyze`` API.
+* Add ``script`` and ``script_id`` options to ``Document.update``
+* ``Facet`` can now use other metric than ``doc_count``
+* ``Range`` objects to help with storing and working with ``_range`` fields
+* Improved behavior of ``Index.save`` where it does a better job when index
+  already exists
+* Composite aggregations now correctly support multiple ``sources`` aggs
+* ``UpdateByQuery`` implementated by @emarcey
+
+6.2.1 (2018-07-03)
+------------------
+
+* allow users to redefine ``doc_type`` in ``Index`` (``#929``)
+* include ``DocType`` in ``elasticsearch_dsl`` module directly (``#930``)
+
+6.2.0 (2018-07-03)
+------------------
+
+**Backwards incompatible change** - ``DocType`` refactoring.
+
+In ``6.2.0`` we refactored the ``DocType`` class and renamed it to
+``Document``. The primary motivation for this was the support for types being
+dropped from elasticsearch itself in ``7.x`` - we needed to somehow link the
+``Index`` and ``Document`` classes. To do this we split the options that were
+previously defined in the ``class Meta`` between it and newly introduced
+``class Index``. The split is that all options that were tied to mappings (like
+setting ``dynamic = MetaField('strict')``) remain in ``class Meta`` and all
+options for index definition (like ``settings``, ``name``, or ``aliases``) got
+moved to the new ``class Index``.
+
+You can see some examples of the new functionality in the ``examples``
+directory. Documentation has been updated to reflect the new API.
+
+``DocType`` is now just an alias for ``Document`` which will be removed in
+``7.x``. It does, however, work in the new way which is not fully backwards
+compatible.
+
+* ``Percolator`` field now expects ``Query`` objects as values
+* you can no longer access meta fields on a ``Document`` instance by specifying
+  ``._id`` or similar. Instead all access needs to happen via the ``.meta``
+  attribute.
+* Implemented ``NestedFacet`` for ``FacetedSearch``. This brought a need to
+  slightly change the semantics of ``Facet.get_values`` which now expects the
+  whole data dict for the aggregation, not just the ``buckets``. This is
+  a backwards incompatible change for custom aggregations that redefine that
+  method.
+* ``Document.update`` now supports ``refresh`` kwarg
+* ``DslBase._clone`` now produces a shallow copy, this means that modifying an
+  existing query can have effects on existing ``Search`` objects.
+* Empty ``Search`` no longer defaults to ``match_all`` query and instead leaves
+  the ``query`` key empty. This is backwards incompatible when using
+  ``suggest``.
+
 6.1.0 (2018-01-09)
 ------------------
 

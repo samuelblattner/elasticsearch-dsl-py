@@ -4,80 +4,77 @@ from ipaddress import ip_address
 
 from elasticsearch import ConflictError, NotFoundError
 
-from elasticsearch_dsl import DocType, Date, Text, Keyword, Mapping, InnerDoc, \
-    Object, Nested, MetaField, Q, Long, Boolean, Double, Binary, Ip
+from elasticsearch_dsl import Document, Date, Text, Keyword, Mapping, InnerDoc, \
+    Object, Nested, MetaField, Q, Long, Boolean, Double, Binary, Ip, analyzer
 from elasticsearch_dsl.utils import AttrList
 
 from pytest import raises, fixture
 
+snowball = analyzer('my_snow',
+    tokenizer='standard',
+    filter=['standard', 'lowercase', 'snowball'])
+
 class User(InnerDoc):
     name = Text(fields={'raw': Keyword()})
 
-class Wiki(DocType):
+class Wiki(Document):
     owner = Object(User)
+    views = Long()
 
-    class Meta:
-        index = 'test-wiki'
+    class Index:
+        name = 'test-wiki'
 
-class Repository(DocType):
+class Repository(Document):
     owner = Object(User)
     created_at = Date()
-    description = Text(analyzer='snowball')
+    description = Text(analyzer=snowball)
     tags = Keyword()
 
     @classmethod
     def search(cls):
         return super(Repository, cls).search().filter('term', commit_repo='repo')
 
-    class Meta:
-        index = 'git'
-        doc_type = 'doc'
+    class Index:
+        name = 'git'
 
-class Commit(DocType):
+class Commit(Document):
     committed_date = Date()
     authored_date = Date()
-    description = Text(analyzer='snowball')
+    description = Text(analyzer=snowball)
+
+    class Index:
+        name = 'flat-git'
 
     class Meta:
-        index = 'flat-git'
-        doc_type = 'doc'
         mapping = Mapping('doc')
+
+class History(InnerDoc):
+    timestamp = Date()
+    diff = Text()
 
 class Comment(InnerDoc):
     content = Text()
     created_at = Date()
     author = Object(User)
+    history = Nested(History)
     class Meta:
         dynamic = MetaField(False)
 
-class PullRequest(DocType):
+class PullRequest(Document):
     comments = Nested(Comment)
     created_at = Date()
-    class Meta:
-        index = 'test-prs'
+    class Index:
+        name = 'test-prs'
 
-class SerializationDoc(DocType):
+class SerializationDoc(Document):
     i = Long()
     b = Boolean()
     d = Double()
     bin = Binary()
     ip = Ip()
 
-    class Meta:
-        index = 'test-serialization'
-
-@fixture
-def pull_request(write_client):
-    PullRequest.init()
-    pr = PullRequest(_id=42,
-                     comments=[
-                         Comment(content='Hello World!',
-                                 author=User(name='honzakral'),
-                                 created_at=datetime(2018, 1, 9, 10, 17, 3, 21184)),
-                     ],
-                     created_at=datetime(2018, 1, 9, 9, 17, 3, 21184))
-    pr.save(refresh=True)
-    return pr
+    class Index:
+        name = 'test-serialization'
 
 def test_serialization(write_client):
     SerializationDoc.init()
@@ -99,7 +96,7 @@ def test_serialization(write_client):
 
     assert sd.to_dict() == {
         'b': [True, False, True, False, None],
-        'bin': [b'SGVsbG8gV29ybGQ=', None],
+        'bin': ['SGVsbG8gV29ybGQ=', None],
         'd': [0.1, -0.1, None],
         'i': [1, 2, 3, None],
         'ip': ['::1', '127.0.0.1', None]
@@ -107,16 +104,26 @@ def test_serialization(write_client):
 
 
 def test_nested_inner_hits_are_wrapped_properly(pull_request):
+    history_query = Q('nested', path='comments.history', inner_hits={},
+                      query=Q('match', comments__history__diff='ahoj'))
     s = PullRequest.search().query('nested', inner_hits={}, path='comments',
-                                   query=Q('match', comments__content='hello'))
+                                   query=history_query)
 
     response = s.execute()
     pr = response.hits[0]
     assert isinstance(pr, PullRequest)
     assert isinstance(pr.comments[0], Comment)
+    assert isinstance(pr.comments[0].history[0], History)
 
     comment = pr.meta.inner_hits.comments.hits[0]
     assert isinstance(comment, Comment)
+    assert comment.author.name == 'honzakral'
+    assert isinstance(comment.history[0], History)
+
+    history = comment.meta.inner_hits['comments.history'].hits[0]
+    assert isinstance(history, History)
+    assert history.timestamp == datetime(2012, 1, 1)
+    assert 'score' in history.meta
 
 
 def test_nested_inner_hits_are_deserialized_properly(pull_request):
@@ -152,6 +159,15 @@ def test_update_object_field(write_client):
     w = Wiki.get(id='elasticsearch-py')
     assert w.owner[0].name == 'Honza'
     assert w.owner[1].name == 'Nick'
+
+def test_update_script(write_client):
+    Wiki.init()
+    w = Wiki(owner=User(name='Honza Kral'), _id='elasticsearch-py', views=42)
+    w.save()
+
+    w.update(script="ctx._source.views += params.inc", inc=5)
+    w = Wiki.get(id='elasticsearch-py')
+    assert w.views == 47
 
 def test_init(write_client):
     Repository.init(index='test-git')
@@ -204,9 +220,9 @@ COMMIT_DOCS_WITH_MISSING = [
 def test_mget(data_client):
     commits = Commit.mget(COMMIT_DOCS_WITH_MISSING)
     assert commits[0] is None
-    assert commits[1]._id == '3ca6e1e73a071a705b4babd2f581c91a2a3e5037'
+    assert commits[1].meta.id == '3ca6e1e73a071a705b4babd2f581c91a2a3e5037'
     assert commits[2] is None
-    assert commits[3]._id == 'eb3e543323f189fd7b698e66295427204fff5755'
+    assert commits[3].meta.id == 'eb3e543323f189fd7b698e66295427204fff5755'
 
 def test_mget_raises_exception_when_missing_param_is_invalid(data_client):
     with raises(ValueError):
@@ -218,8 +234,8 @@ def test_mget_raises_404_when_missing_param_is_raise(data_client):
 
 def test_mget_ignores_missing_docs_when_missing_param_is_skip(data_client):
     commits = Commit.mget(COMMIT_DOCS_WITH_MISSING, missing='skip')
-    assert commits[0]._id == '3ca6e1e73a071a705b4babd2f581c91a2a3e5037'
-    assert commits[1]._id == 'eb3e543323f189fd7b698e66295427204fff5755'
+    assert commits[0].meta.id == '3ca6e1e73a071a705b4babd2f581c91a2a3e5037'
+    assert commits[1].meta.id == 'eb3e543323f189fd7b698e66295427204fff5755'
 
 def test_update_works_from_search_response(data_client):
     elasticsearch_repo = Repository.search().execute()[0]
@@ -269,20 +285,48 @@ def test_save_automatically_uses_versions(data_client):
     with raises(ConflictError):
         elasticsearch_repo.save()
 
+def assert_doc_equals(expected, actual):
+    for f in expected:
+        assert f in actual
+        assert actual[f] == expected[f]
+
 def test_can_save_to_different_index(write_client):
     test_repo = Repository(description='testing', meta={'id': 42})
     test_repo.meta.version_type = 'external'
     test_repo.meta.version = 3
     assert test_repo.save(index='test-document')
 
-    assert {
-        'found': True,
-        '_index': 'test-document',
-        '_type': 'doc',
-        '_id': '42',
-        '_version': 3,
-        '_source': {'description': 'testing'},
-    } == write_client.get(index='test-document', doc_type='doc', id=42)
+    assert_doc_equals({
+            'found': True,
+            '_index': 'test-document',
+            '_type': 'doc',
+            '_id': '42',
+            '_version': 3,
+            '_source': {'description': 'testing'},
+        },
+        write_client.get(index='test-document', doc_type='doc', id=42)
+    )
+
+def test_save_without_skip_empty_will_include_empty_fields(write_client):
+    test_repo = Repository(field_1=[], field_2=None, field_3={}, meta={'id': 42})
+    test_repo.meta.version_type = 'external'
+    test_repo.meta.version = 3
+    assert test_repo.save(index='test-document', skip_empty=False)
+
+    assert_doc_equals({
+            'found': True,
+            '_index': 'test-document',
+            '_type': 'doc',
+            '_id': '42',
+            '_version': 3,
+            '_source': {
+                "field_1": [],
+                "field_2": None,
+                "field_3": {}
+            },
+        },
+        write_client.get(index='test-document', doc_type='doc', id=42)
+    )
 
 def test_delete(write_client):
     write_client.create(
@@ -314,18 +358,17 @@ def test_search_returns_proper_doc_classes(data_client):
     assert elasticsearch_repo.owner.name == 'elasticsearch'
 
 def test_refresh_mapping(data_client):
-    class Commit(DocType):
-        class Meta:
-            doc_type = 'doc'
-            index = 'git'
+    class Commit(Document):
+        class Index:
+            name = 'git'
 
-    Commit._doc_type.refresh()
+    Commit._index.load_mappings()
 
-    assert 'stats' in Commit._doc_type.mapping
-    assert 'committer' in Commit._doc_type.mapping
-    assert 'description' in Commit._doc_type.mapping
-    assert 'committed_date' in Commit._doc_type.mapping
-    assert isinstance(Commit._doc_type.mapping['committed_date'], Date)
+    assert 'stats' in Commit._index._mapping
+    assert 'committer' in Commit._index._mapping
+    assert 'description' in Commit._index._mapping
+    assert 'committed_date' in Commit._index._mapping
+    assert isinstance(Commit._index._mapping['committed_date'], Date)
 
 def test_highlight_in_meta(data_client):
     commit = Commit.search().query('match', description='inverting').highlight('description').execute()[0]

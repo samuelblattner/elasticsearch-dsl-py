@@ -1,6 +1,6 @@
 from copy import deepcopy
 
-from elasticsearch_dsl import search, query, Q, DocType, utils
+from elasticsearch_dsl import search, query, Q, Document, utils
 from elasticsearch_dsl.exceptions import IllegalOperation
 
 from pytest import raises
@@ -127,6 +127,25 @@ def test_copy_clones():
     assert s1 == s2
     assert s1 is not s2
 
+def test_aggs_allow_two_metric():
+    s = search.Search()
+
+    s.aggs.metric('a', 'max', field='a').metric('b', 'max', field='b')
+
+    assert s.to_dict() ==  {
+        'aggs': {
+            'a': {
+                'max': {
+                    'field': 'a'
+                }
+            },
+            'b': {
+                'max': {
+                    'field': 'b'
+                }
+            }
+        }
+    }
 
 def test_aggs_get_copied_on_change():
     s = search.Search().query('match_all')
@@ -207,16 +226,16 @@ def test_search_doc_type():
 
 
 def test_doc_type_can_be_document_class():
-    class MyDocType(DocType):
+    class MyDocument(Document):
         pass
 
-    s = search.Search(doc_type=MyDocType)
-    assert s._doc_type == [MyDocType]
+    s = search.Search(doc_type=MyDocument)
+    assert s._doc_type == [MyDocument]
     assert s._doc_type_map == {}
     assert s._get_doc_type() == ['doc']
 
-    s = search.Search().doc_type(MyDocType)
-    assert s._doc_type == [MyDocType]
+    s = search.Search().doc_type(MyDocument)
+    assert s._doc_type == [MyDocument]
     assert s._doc_type_map == {}
     assert s._get_doc_type() == ['doc']
 

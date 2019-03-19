@@ -1,22 +1,27 @@
 import base64
 import ipaddress
 
-import collections
+try:
+    import collections.abc as collections_abc  # only works on python 3.3+
+except ImportError:
+    import collections as collections_abc
 
 from datetime import date, datetime
 
 from dateutil import parser, tz
-from six import itervalues, string_types, iteritems
+from six import string_types, iteritems
 from six.moves import map
 
-from .utils import DslBase, ObjectBase, AttrDict, AttrList
+from .query import Q
+from .utils import DslBase, AttrDict, AttrList
 from .exceptions import ValidationException
+from .wrappers import Range
 
 unicode = type(u'')
 
 def construct_field(name_or_field, **params):
     # {"type": "text", "analyzer": "snowball"}
-    if isinstance(name_or_field, collections.Mapping):
+    if isinstance(name_or_field, collections_abc.Mapping):
         if params:
             raise ValueError('construct_field() cannot accept parameters when passing in a dict.')
         params = name_or_field.copy()
@@ -47,9 +52,13 @@ class Field(DslBase):
     name = None
     _coerce = False
 
-    def __init__(self, *args, **kwargs):
-        self._multi = kwargs.pop('multi', False)
-        self._required = kwargs.pop('required', False)
+    def __init__(self, multi=False, required=False, *args, **kwargs):
+        """
+        :arg bool multi: specifies whether field can contain array of values
+        :arg bool required: specifies whether field is required
+        """
+        self._multi = multi
+        self._required = required
         super(Field, self).__init__(*args, **kwargs)
 
     def __getitem__(self, subfield):
@@ -70,11 +79,14 @@ class Field(DslBase):
         return self._empty()
 
     def serialize(self, data):
-        if isinstance(data, (list, AttrList)):
+        if isinstance(data, (list, AttrList, tuple)):
             return list(map(self._serialize, data))
         return self._serialize(data)
 
     def deserialize(self, data):
+        if isinstance(data, tuple):
+            data = list(data)
+
         if isinstance(data, (list, AttrList)):
             data[:] = [
                 None if d is None else self._deserialize(d)
@@ -114,17 +126,33 @@ class Object(Field):
     name = 'object'
     _coerce = True
 
-    def __init__(self, doc_class=None, **kwargs):
-        self._doc_class = doc_class
-        if doc_class is None:
+    def __init__(self, doc_class=None, dynamic=None, properties=None, **kwargs):
+        """
+        :arg document.InnerDoc doc_class: base doc class that handles mapping.
+            If no `doc_class` is provided, new instance of `InnerDoc` will be created,
+            populated with `properties` and used. Can not be provided together with `properties`
+        :arg dynamic: whether new properties may be created dynamically.
+            Valid values are `True`, `False`, `'strict'`.
+            Can not be provided together with `doc_class`.
+            See https://www.elastic.co/guide/en/elasticsearch/reference/current/dynamic.html
+            for more details
+        :arg dict properties: used to construct underlying mapping if no `doc_class` is provided.
+            Can not be provided together with `doc_class`
+        """
+        if doc_class and (properties or dynamic is not None):
+            raise ValidationException(
+                'doc_class and properties/dynamic should not be provided together')
+        if doc_class:
+            self._doc_class = doc_class
+        else:
             # FIXME import
             from .document import InnerDoc
             # no InnerDoc subclass, creating one instead...
             self._doc_class = type('InnerDoc', (InnerDoc, ), {})
-            for name, field in iteritems(kwargs.pop('properties', {})):
+            for name, field in iteritems(properties or {}):
                 self._doc_class._doc_type.mapping.field(name, field)
-            if 'dynamic' in kwargs:
-                self._doc_class._doc_type.mapping.meta('dynamic', kwargs.pop('dynamic'))
+            if dynamic is not None:
+                self._doc_class._doc_type.mapping.meta('dynamic', dynamic)
 
         self._mapping = self._doc_class._doc_type.mapping
         super(Object, self).__init__(**kwargs)
@@ -139,7 +167,7 @@ class Object(Field):
         return self._wrap({})
 
     def _wrap(self, data):
-        return self._doc_class.from_es(data)
+        return self._doc_class.from_es(data, data_only=True)
 
     def empty(self):
         if self._multi:
@@ -149,7 +177,7 @@ class Object(Field):
     def to_dict(self):
         d = self._mapping.to_dict()
         _, d = d.popitem()
-        d["type"] = self.name
+        d.update(super(Object, self).to_dict())
         return d
 
     def _collect_fields(self):
@@ -170,7 +198,7 @@ class Object(Field):
             return None
 
         # somebody assigned raw dict to the field, we should tolerate that
-        if isinstance(data, collections.Mapping):
+        if isinstance(data, collections_abc.Mapping):
             return data
 
         return data.to_dict()
@@ -204,8 +232,12 @@ class Date(Field):
     name = 'date'
     _coerce = True
 
-    def __init__(self, *args, **kwargs):
-        self._default_timezone = kwargs.pop('default_timezone', None)
+    def __init__(self, default_timezone=None, *args, **kwargs):
+        """
+        :arg default_timezone: timezone that will be automatically used for tz-naive values
+            May be instance of `datetime.tzinfo` or string containing TZ offset
+        """
+        self._default_timezone = default_timezone
         if isinstance(self._default_timezone, string_types):
             self._default_timezone = tz.gettz(self._default_timezone)
         super(Date, self).__init__(*args, **kwargs)
@@ -314,13 +346,18 @@ class Binary(Field):
     name = 'binary'
     _coerce = True
 
+    def clean(self, data):
+        # Binary fields are opaque, so there's not much cleaning
+        # that can be done.
+        return data
+
     def _deserialize(self, data):
         return base64.b64decode(data)
 
     def _serialize(self, data):
         if data is None:
             return None
-        return base64.b64encode(data)
+        return base64.b64encode(data).decode()
 
 class GeoPoint(Field):
     name = 'geo_point'
@@ -329,25 +366,65 @@ class GeoShape(Field):
     name = 'geo_shape'
 
 class Completion(Field):
+    _param_defs = {
+        'analyzer': {'type': 'analyzer'},
+        'search_analyzer': {'type': 'analyzer'},
+    }
     name = 'completion'
 
 class Percolator(Field):
     name = 'percolator'
+    _coerce = True
 
-class IntegerRange(Field):
+    def _deserialize(self, data):
+        return Q(data)
+
+    def _serialize(self, data):
+        if data is None:
+            return None
+        return data.to_dict()
+
+class RangeField(Field):
+    _coerce = True
+    _core_field = None
+
+    def _deserialize(self, data):
+        if isinstance(data, Range):
+            return data
+        data = dict((k, self._core_field.deserialize(v)) for k, v in iteritems(data))
+        return Range(data)
+
+    def _serialize(self, data):
+        if data is None:
+            return None
+        if not isinstance(data, collections_abc.Mapping):
+            data = data.to_dict()
+        return dict((k, self._core_field.serialize(v)) for k, v in iteritems(data))
+
+
+class IntegerRange(RangeField):
     name = 'integer_range'
+    _core_field = Integer()
 
-class FloatRange(Field):
+class FloatRange(RangeField):
     name = 'float_range'
+    _core_field = Float()
 
-class LongRange(Field):
+class LongRange(RangeField):
     name = 'long_range'
+    _core_field = Long()
 
-class DoubleRange(Field):
+class DoubleRange(RangeField):
     name = 'double_ranged'
+    _core_field = Double()
 
-class DateRange(Field):
+class DateRange(RangeField):
     name = 'date_range'
+    _core_field = Date()
+
+class IpRange(Field):
+    # not a RangeField since ip_range supports CIDR ranges
+    name = 'ip_range'
 
 class Join(Field):
     name = 'join'

@@ -1,4 +1,7 @@
-import collections
+try:
+    import collections.abc as collections_abc  # only works on python 3.3+
+except ImportError:
+    import collections as collections_abc
 
 from .utils import DslBase
 from .response.aggs import BucketData, FieldBucketData, AggResponse, TopHitsData
@@ -10,7 +13,7 @@ def A(name_or_agg, filter=None, **params):
         params['filter'] = filter
 
     # {"terms": {"field": "tags"}, "aggs": {...}}
-    if isinstance(name_or_agg, collections.Mapping):
+    if isinstance(name_or_agg, collections_abc.Mapping):
         if params:
             raise ValueError('A() cannot accept parameters when passing in a dict.')
         # copy to avoid modifying in-place
@@ -156,6 +159,9 @@ class DateHistogram(Bucket):
     def result(self, search, data):
         return FieldBucketData(self, search, data)
 
+class AutoDateHistogram(DateHistogram):
+    name = 'auto_date_histogram'
+
 class DateRange(Bucket):
     name = 'date_range'
 
@@ -176,10 +182,6 @@ class Histogram(Bucket):
     def result(self, search, data):
         return FieldBucketData(self, search, data)
 
-# TODO: remove in 6.0
-class Iprange(Bucket):
-    name = 'ip_range'
-
 class IPRange(Bucket):
     name = 'ip_range'
 
@@ -198,6 +200,9 @@ class ReverseNested(Bucket):
 class SignificantTerms(Bucket):
     name = 'significant_terms'
 
+class SignificantText(Bucket):
+    name = 'significant_text'
+
 class Terms(Bucket):
     name = 'terms'
 
@@ -210,6 +215,13 @@ class Sampler(Bucket):
 class DiversifiedSampler(Bucket):
     name = 'diversified_sampler'
 
+class Composite(Bucket):
+    name = 'composite'
+    _param_defs = {
+        'sources': {'type': 'agg', 'hash': True, 'multi': True},
+        'aggs': {'type': 'agg', 'hash': True},
+    }
+
 # metric aggregations
 class TopHits(Agg):
     name = 'top_hits'
@@ -219,6 +231,9 @@ class TopHits(Agg):
 
 class Avg(Agg):
     name = 'avg'
+
+class WeightedAvg(Agg):
+    name = 'weighted_avg'
 
 class Cardinality(Agg):
     name = 'cardinality'
@@ -292,3 +307,6 @@ class StatsBucket(Pipeline):
 
 class SumBucket(Pipeline):
     name = 'sum_bucket'
+
+class BucketSort(Pipeline):
+    name = 'bucket_sort'

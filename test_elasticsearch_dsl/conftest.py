@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+from datetime import datetime
 
 from elasticsearch.helpers import bulk
 from elasticsearch.helpers.test import SkipTest, get_test_client
@@ -8,8 +9,9 @@ from mock import Mock
 from pytest import fixture, skip
 
 from elasticsearch_dsl.connections import connections
-from .test_integration.test_data import DATA, FLAT_DATA, create_git_index, \
-    create_flat_git_index
+from .test_integration.test_data import DATA, FLAT_DATA, TEST_GIT_DATA, \
+    create_git_index, create_flat_git_index
+from .test_integration.test_document import PullRequest, Comment, User, History
 
 
 @fixture(scope='session')
@@ -28,9 +30,9 @@ def write_client(client):
     client.indices.delete_template('test-template', ignore=404)
 
 @fixture
-def mock_client():
+def mock_client(dummy_response):
     client = Mock()
-    client.search.return_value = dummy_response()
+    client.search.return_value = dummy_response
     connections.add_connection('mock', client)
     yield client
     connections._conn = {}
@@ -217,3 +219,30 @@ def aggs_data():
             }
         }
     }
+
+@fixture
+def pull_request(write_client):
+    PullRequest.init()
+    pr = PullRequest(_id=42,
+                     comments=[
+                         Comment(content='Hello World!',
+                                 author=User(name='honzakral'),
+                                 created_at=datetime(2018, 1, 9, 10, 17, 3, 21184),
+                                 history=[
+                                     History(
+                                         timestamp=datetime(2012, 1, 1),
+                                         diff='-Ahoj Svete!\n+Hello World!'
+                                     )
+                                 ]
+                        ),
+                     ],
+                     created_at=datetime(2018, 1, 9, 9, 17, 3, 21184))
+    pr.save(refresh=True)
+    return pr
+
+@fixture
+def setup_ubq_tests(client):
+    index = 'test-git'
+    create_git_index(client, index)
+    bulk(client, TEST_GIT_DATA, raise_on_error=True, refresh=True)
+    return index

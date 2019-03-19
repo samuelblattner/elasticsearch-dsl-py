@@ -1,6 +1,11 @@
 from __future__ import unicode_literals
 
-import collections
+try:
+    import collections.abc as collections_abc  # only works on python 3.3+
+except ImportError:
+    import collections as collections_abc
+
+from copy import copy
 
 from six import iteritems, add_metaclass
 from six.moves import map
@@ -8,10 +13,10 @@ from six.moves import map
 from .exceptions import UnknownDslObject, ValidationException
 
 SKIP_VALUES = ('', None)
-EXPAND__TO_DOT=True
+EXPAND__TO_DOT = True
 
 DOC_META_FIELDS = frozenset((
-    'id', 'routing', 'version', 'version_type'
+    'id', 'routing', 'version', 'version_type', 'parent'
 ))
 
 META_FIELDS = frozenset((
@@ -20,7 +25,7 @@ META_FIELDS = frozenset((
 )).union(DOC_META_FIELDS)
 
 def _wrap(val, obj_wrapper=None):
-    if isinstance(val, collections.Mapping):
+    if isinstance(val, collections_abc.Mapping):
         return AttrDict(val) if obj_wrapper is None else obj_wrapper(val)
     if isinstance(val, list):
         return AttrList(val)
@@ -198,7 +203,7 @@ class DslBase(object):
 
     Provides several feature:
         - attribute access to the wrapped dictionary (.field instead of ['field'])
-        - _clone method returning a deep copy of self
+        - _clone method returning a copy of self
         - to_dict method to serialize into dict (to be sent via elasticsearch-py)
         - basic logical operators (&, | and ~) using a Bool(Filter|Query) TODO:
           move into a class specific for Query/Filter
@@ -256,7 +261,13 @@ class DslBase(object):
             if 'type' in pinfo:
                 # get the shortcut used to construct this type (query.Q, aggs.A, etc)
                 shortcut = self.__class__.get_dsl_type(pinfo['type'])
-                if pinfo.get('multi'):
+
+                # list of dict(name -> DslBase)
+                if pinfo.get('multi') and pinfo.get('hash'):
+                    if not isinstance(value, (tuple, list)):
+                        value = (value, )
+                    value = list(dict((k, shortcut(v)) for (k, v) in iteritems(obj)) for obj in value)
+                elif pinfo.get('multi'):
                     if not isinstance(value, (tuple, list)):
                         value = (value, )
                     value = list(map(shortcut, value))
@@ -292,7 +303,7 @@ class DslBase(object):
                 '%r object has no attribute %r' % (self.__class__.__name__, name))
 
         # wrap nested dicts in AttrDict for convenient access
-        if isinstance(value, collections.Mapping):
+        if isinstance(value, collections_abc.Mapping):
             return AttrDict(value)
         return value
 
@@ -310,8 +321,15 @@ class DslBase(object):
                 if value in ({}, []):
                     continue
 
+                # list of dict(name -> DslBase)
+                if pinfo.get('multi') and pinfo.get('hash'):
+                    value = list(
+                        dict((k, v.to_dict()) for k, v in iteritems(obj))
+                        for obj in value
+                    )
+
                 # multi-values are serialized as list of dicts
-                if pinfo.get('multi'):
+                elif pinfo.get('multi'):
                     value = list(map(lambda x: x.to_dict(), value))
 
                 # squash all the hash values into one dict
@@ -330,12 +348,62 @@ class DslBase(object):
         return {self.name: d}
 
     def _clone(self):
-        return self._type_shortcut(self.to_dict())
+        c = self.__class__()
+        for attr in self._params:
+            c._params[attr] = copy(self._params[attr])
+        return c
 
+class HitMeta(AttrDict):
+    def __init__(self, document, exclude=('_source', '_fields')):
+        d = dict((k[1:] if k.startswith('_') else k, v) for (k, v) in iteritems(document) if k not in exclude)
+        if 'type' in d:
+            # make sure we are consistent everywhere in python
+            d['doc_type'] = d.pop('type')
+        super(HitMeta, self).__init__(d)
 
 class ObjectBase(AttrDict):
-    def __init__(self, **kwargs):
+    def __init__(self, meta=None, **kwargs):
+        meta = meta or {}
+        for k in list(kwargs):
+            if k.startswith('_') and k[1:] in META_FIELDS:
+                meta[k] = kwargs.pop(k)
+
+        super(AttrDict, self).__setattr__('meta', HitMeta(meta))
+
         super(ObjectBase, self).__init__(kwargs)
+
+    @classmethod
+    def __list_fields(cls):
+        """
+        Get all the fields defined for our class, if we have an Index, try
+        looking at the index mappings as well, mark the fields from Index as
+        optional.
+        """
+        for name in cls._doc_type.mapping:
+            field = cls._doc_type.mapping[name]
+            yield name, field, False
+
+        if hasattr(cls.__class__, '_index'):
+            if not cls._index._mapping:
+                return
+            for name in cls._index._mapping:
+                # don't return fields that are in _doc_type
+                if name in cls._doc_type.mapping:
+                    continue
+                field = cls._index._mapping[name]
+                yield name, field, True
+
+    @classmethod
+    def __get_field(cls, name):
+        try:
+            return cls._doc_type.mapping[name]
+        except KeyError:
+            # fallback to fields on the Index
+            if hasattr(cls, '_index') and cls._index._mapping:
+                try:
+                    return cls._index._mapping[name]
+                except KeyError:
+                    pass
 
     @classmethod
     def from_es(cls, hit):
@@ -349,55 +417,65 @@ class ObjectBase(AttrDict):
                     data[k] = v
 
         doc = cls(meta=meta)
-        m = cls._doc_type.mapping
-        for k, v in iteritems(data):
-            if k in m and m[k]._coerce:
-                v = m[k].deserialize(v)
-            setattr(doc, k, v)
+        doc._from_dict(data)
         return doc
+
+    def _from_dict(self, data):
+        for k, v in iteritems(data):
+            f = self.__get_field(k)
+            if f and f._coerce:
+                v = f.deserialize(v)
+            setattr(self, k, v)
+
+    def __getstate__(self):
+        return (self.to_dict(), self.meta._d_)
+
+    def __setstate__(self, state):
+        data, meta = state
+        super(AttrDict, self).__setattr__('_d_', {})
+        super(AttrDict, self).__setattr__('meta', HitMeta(meta))
+        self._from_dict(data)
 
     def __getattr__(self, name):
         try:
             return super(ObjectBase, self).__getattr__(name)
         except AttributeError:
-            if name in self._doc_type.mapping:
-                f = self._doc_type.mapping[name]
-                if hasattr(f, 'empty'):
-                    value = f.empty()
-                    if value not in SKIP_VALUES:
-                        setattr(self, name, value)
-                        value = getattr(self, name)
-                    return value
+            f = self.__get_field(name)
+            if hasattr(f, 'empty'):
+                value = f.empty()
+                if value not in SKIP_VALUES:
+                    setattr(self, name, value)
+                    value = getattr(self, name)
+                return value
             raise
 
-    def to_dict(self):
+    def to_dict(self, skip_empty=True):
         out = {}
         for k, v in iteritems(self._d_):
-            try:
-                f = self._doc_type.mapping[k]
-            except KeyError:
-                pass
-            else:
-                if f._coerce:
-                    v = f.serialize(v)
+            # if this is a mapped field,
+            f = self.__get_field(k)
+            if f and f._coerce:
+                v = f.serialize(v)
 
             # if someone assigned AttrList, unwrap it
             if isinstance(v, AttrList):
                 v = v._l_
 
-            # don't serialize empty values
-            # careful not to include numeric zeros
-            if v in ([], {}, None):
-                continue
+            if skip_empty:
+                # don't serialize empty values
+                # careful not to include numeric zeros
+                if v in ([], {}, None):
+                    continue
 
             out[k] = v
         return out
 
     def clean_fields(self):
         errors = {}
-        for name in self._doc_type.mapping:
-            field = self._doc_type.mapping[name]
+        for name, field, optional in self.__list_fields():
             data = self._d_.get(name, None)
+            if data is None and optional:
+                continue
             try:
                 # save the cleaned value
                 data = field.clean(data)
@@ -417,14 +495,16 @@ class ObjectBase(AttrDict):
         self.clean_fields()
         self.clean()
 
-def merge(data, new_data):
-    if not (isinstance(data, (AttrDict, collections.Mapping))
-            and isinstance(new_data, (AttrDict, collections.Mapping))):
+def merge(data, new_data, raise_on_conflict=False):
+    if not (isinstance(data, (AttrDict, collections_abc.Mapping))
+            and isinstance(new_data, (AttrDict, collections_abc.Mapping))):
         raise ValueError('You can only merge two dicts! Got %r and %r instead.' % (data, new_data))
 
     for key, value in iteritems(new_data):
-        if key in data and isinstance(getattr(data, key), (AttrDict, collections.Mapping)) and \
-                isinstance(value, (AttrDict, collections.Mapping)):
-            merge(getattr(data, key), value)
+        if key in data and isinstance(data[key], (AttrDict, collections_abc.Mapping)) and \
+                isinstance(value, (AttrDict, collections_abc.Mapping)):
+            merge(data[key], value, raise_on_conflict)
+        elif key in data and data[key] != value and raise_on_conflict:
+            raise ValueError('Incompatible data for key %r, cannot be merged.' % key)
         else:
-            setattr(data, key, value)
+            data[key] = value

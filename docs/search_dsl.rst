@@ -1,3 +1,5 @@
+.. _search_dsl:
+
 Search DSL
 ==========
 
@@ -23,9 +25,10 @@ The ``Search`` object represents the entire search request:
 
 The API is designed to be chainable. With the exception of the
 aggregations functionality this means that the ``Search`` object is immutable -
-all changes to the object will result in a copy being created which contains
-the changes. This means you can safely pass the ``Search`` object to foreign
-code without fear of it modifying your objects.
+all changes to the object will result in a shallow copy being created which
+contains the changes. This means you can safely pass the ``Search`` object to
+foreign code without fear of it modifying your objects as long as it sticks to
+the ``Search`` object APIs.
 
 You can pass an instance of the low-level `elasticsearch client <https://elasticsearch-py.readthedocs.io/>`_ when
 instantiating the ``Search`` object:
@@ -40,7 +43,7 @@ instantiating the ``Search`` object:
     s = Search(using=client)
 
 You can also define the client at a later time (for more options see the
-~:ref:`connections` chapter):
+:ref:`configuration` chapter):
 
 .. code:: python
 
@@ -92,7 +95,7 @@ You can delete the documents matching a search by calling ``delete`` on the ``Se
 
 .. code:: python
 
-    s = Search().query("match", title="python")
+    s = Search(index='i').query("match", title="python")
     response = s.delete()
 
 
@@ -131,6 +134,8 @@ parameters or the raw ``dict``:
 
 .. code:: python
 
+    from elasticsearch_dsl import Q
+
     Q("multi_match", query='python django', fields=['title', 'body'])
     Q({"multi_match": {"query": "python django", "fields": ["title", "body"]}})
 
@@ -154,6 +159,28 @@ just override the query used in the ``Search`` object:
 
     s.query = Q('bool', must=[Q('match', title='python'), Q('match', body='best')])
 
+Dotted fields
+^^^^^^^^^^^^^
+
+Sometimes you want to refer to a field within another field, either as
+a multi-field (``title.keyword``) or in a structured ``json`` document like
+``address.city``. To make it easier, the ``Q`` shortcut (as well as the
+``query``, ``filter``, and ``exclude`` methods on ``Search`` class) allows you
+to use ``__`` (double underscore) in place of a dot in a keyword argument:
+
+.. code:: python
+
+    s = Search()
+    s = s.filter('term', category__keyword='Python')
+    s = s.query('match', address__city='prague')
+
+Alternatively you can always fall back to python's kwarg unpacking if you prefer:
+
+.. code:: python
+
+    s = Search()
+    s = s.filter('term', **{'category.keyword': 'Python'})
+    s = s.query('match', **{'address.city': 'prague'})
 
 Query combination
 ^^^^^^^^^^^^^^^^^
@@ -233,6 +260,8 @@ Aggregations
 To define an aggregation, you can use the ``A`` shortcut:
 
 .. code:: python
+
+    from elasticsearch_dsl import A
 
     A('terms', field='tags')
     # {"terms": {"field": "tags"}}
@@ -379,7 +408,7 @@ Enabling highlighting for individual fields is done using the ``highlight`` meth
     # or, including parameters:
     s = s.highlight('title', fragment_size=50)
 
-The fragments in the response will then be available on reach ``Result`` object
+The fragments in the response will then be available on each ``Result`` object
 as ``.meta.highlight.FIELD`` which will contain the list of fragments:
 
 .. code:: python
@@ -404,15 +433,6 @@ keyword arguments will be added to the suggest's json as-is which means that it
 should be one of ``term``, ``phrase`` or ``completion`` to indicate which type
 of suggester should be used.
 
-If you only wish to run the suggestion part of the search (via the ``_suggest``
-endpoint) you can do so via ``execute_suggest``:
-
-.. code:: python
-
-    s = s.suggest('my_suggestion', 'pyhton', term={'field': 'title'})
-    suggestions = s.execute_suggest()
-
-    print(suggestions.my_suggestion)
 
 Extra properties and parameters
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -429,7 +449,7 @@ To set query parameters, use the ``.params()`` method:
 
 .. code:: python
 
-  s = s.params(search_type="count")
+  s = s.params(routing="42")
 
 
 If you need to limit the fields being returned by elasticsearch, use the

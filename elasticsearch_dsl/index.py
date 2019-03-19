@@ -1,22 +1,93 @@
 from .connections import connections
 from .search import Search
+from .update_by_query import UpdateByQuery
 from .exceptions import IllegalOperation
+from .mapping import Mapping
+from .utils import merge
+from . import analysis
 
-class IndexBody(object):
-    def __init__(self, name, using='default'):
+DEFAULT_DOC_TYPE = 'doc'
+
+class IndexTemplate(object):
+    def __init__(self, name, template, index=None, **kwargs):
+        if index is None:
+            self._index = Index(template, **kwargs)
+        else:
+            if kwargs:
+                raise ValueError("You cannot specify options for Index when"
+                                 " passing an Index instance.")
+            self._index = index.clone()
+            self._index._name = template
+        self._template_name = name
+
+    def __getattr__(self, attr_name):
+        return getattr(self._index, attr_name)
+
+    def to_dict(self):
+        d = self._index.to_dict()
+        d['index_patterns'] = [self._index._name]
+        return d
+
+    def save(self, using=None):
+        es = connections.get_connection(using or self._index._using)
+        es.indices.put_template(name=self._template_name, body=self.to_dict())
+
+class Index(object):
+    def __init__(self, name, doc_type=DEFAULT_DOC_TYPE, using='default'):
         """
         :arg name: name of the index
         :arg using: connection alias to use, defaults to ``'default'``
         """
         self._name = name
-        self._doc_types = {}
-        self._mappings = {}
+        self._doc_types = []
         self._using = using
         self._settings = {}
         self._aliases = {}
         self._analysis = {}
+        self._mapping = None
+        if doc_type is not DEFAULT_DOC_TYPE:
+            self._mapping = Mapping(doc_type)
 
-    def clone(self, name, using=None):
+    def _get_doc_type(self):
+        if self._mapping is not None:
+            return self._mapping.doc_type
+        for d in self._doc_types:
+            return d._doc_type.name
+        return None
+
+    def get_or_create_mapping(self, doc_type=DEFAULT_DOC_TYPE):
+        if self._mapping is None:
+            self._mapping = Mapping(doc_type)
+        return self._mapping
+
+    def as_template(self, template_name, pattern=None):
+        # TODO: should we allow pattern to be a top-level arg?
+        # or maybe have an IndexPattern that allows for it and have
+        # Document._index be that?
+        return IndexTemplate(template_name, pattern or self._name, index=self)
+
+    def resolve_nested(self, field_path):
+        for doc in self._doc_types:
+            nested, field = doc._doc_type.mapping.resolve_nested(field_path)
+            if field is not None:
+                return nested, field
+        if self._mapping:
+            return self._mapping.resolve_nested(field_path)
+        return (), None
+
+    def resolve_field(self, field_path):
+        for doc in self._doc_types:
+            field = doc._doc_type.mapping.resolve_field(field_path)
+            if field is not None:
+                return field
+        if self._mapping:
+            return self._mapping.resolve_field(field_path)
+        return None
+
+    def load_mappings(self, using=None):
+        self.get_or_create_mapping().update_from_es(self._name, using=using or self._using)
+
+    def clone(self, name=None, doc_type=None, using=None):
         """
         Create a copy of the instance with another name or connection alias.
         Useful for creating multiple indices with shared configuration::
@@ -31,14 +102,20 @@ class IndexBody(object):
         :arg name: name of the index
         :arg using: connection alias to use, defaults to ``'default'``
         """
-        i = Index(name, using=using or self._using)
-        for attr in ('_doc_types', '_mappings', '_settings', '_aliases',
-                     '_analysis'):
-            setattr(i, attr, getattr(self, attr).copy())
+        doc_type = doc_type or self._get_doc_type() or DEFAULT_DOC_TYPE
+        i = Index(name or self._name,
+                  doc_type=doc_type,
+                  using=using or self._using)
+        i._settings = self._settings.copy()
+        i._aliases = self._aliases.copy()
+        i._analysis = self._analysis.copy()
+        i._doc_types = self._doc_types[:]
+        if self._mapping is not None:
+            i._mapping = self._mapping._clone()
         return i
 
-    def _get_connection(self):
-        return connections.get_connection(self._using)
+    def _get_connection(self, using=None):
+        return connections.get_connection(using or self._using)
     connection = property(_get_connection)
 
     def mapping(self, mapping):
@@ -48,20 +125,24 @@ class IndexBody(object):
         This means that, when this index is created, it will contain the
         mappings for the document type defined by those mappings.
         """
-        self._mappings[mapping.doc_type] = mapping
+        if self._mapping is not None and mapping.doc_type != self._mapping.doc_type:
+            raise IllegalOperation(
+                'Index object cannot have multiple types, %s already set, '
+                'trying to assign %s.' % (self._mapping.doc_type, mapping.doc_type))
+        self.get_or_create_mapping(mapping.doc_type).update(mapping)
 
-    def doc_type(self, doc_type):
+    def document(self, document):
         """
-        Associate a :class:`~elasticsearch_dsl.DocType` subclass with an index.
+        Associate a :class:`~elasticsearch_dsl.Document` subclass with an index.
         This means that, when this index is created, it will contain the
-        mappings for the ``DocType``. If the ``DocType`` class doesn't have a
-        default index yet, name of the ``Index`` instance will be used. Can be
-        used as a decorator::
+        mappings for the ``Document``. If the ``Document`` class doesn't have a
+        default index yet (by defining ``class Index``), this instance will be
+        used. Can be used as a decorator::
 
             i = Index('blog')
 
-            @i.doc_type
-            class Post(DocType):
+            @i.document
+            class Post(Document):
                 title = Text()
 
             # create the index, including Post mappings
@@ -71,13 +152,15 @@ class IndexBody(object):
             # properly deserialized Post instances
             s = i.search()
         """
-        name = doc_type._doc_type.name
-        self._doc_types[name] = doc_type
-        self._mappings[name] = doc_type._doc_type.mapping
-
-        if not doc_type._doc_type.index:
-            doc_type._doc_type.index = self._name
-        return doc_type  # to use as decorator???
+        name = document._doc_type.name
+        doc_type = self._get_doc_type()
+        if doc_type and name != doc_type:
+            raise IllegalOperation(
+                'Index object cannot have multiple types, %s already set, '
+                'trying to assign %s.' % (doc_type, name))
+        self._doc_types.append(document)
+        return document
+    doc_type = document
 
     def settings(self, **kwargs):
         """
@@ -102,7 +185,7 @@ class IndexBody(object):
         self._aliases.update(kwargs)
         return self
 
-    def analyzer(self, analyzer):
+    def analyzer(self, *args, **kwargs):
         """
         Explicitly add an analyzer to an index. Note that all custom analyzers
         defined in mappings will also be created. This is useful for search analyzers.
@@ -120,27 +203,14 @@ class IndexBody(object):
             i.analyzer(my_analyzer)
 
         """
+        analyzer = analysis.analyzer(*args, **kwargs)
         d = analyzer.get_analysis_definition()
         # empty custom analyzer, probably already defined out of our control
         if not d:
             return
 
         # merge the definition
-        # TODO: conflict detection/resolution
-        for key in d:
-            self._analysis.setdefault(key, {}).update(d[key])
-
-    def _get_mappings(self):
-        analysis, mappings = {}, {}
-        for mapping in self._mappings.values():
-            mappings.update(mapping.to_dict())
-            a = mapping._collect_analysis()
-            # merge the definition
-            # TODO: conflict detection/resolution
-            for key in a:
-                analysis.setdefault(key, {}).update(a[key])
-
-        return mappings, analysis
+        merge(self._analysis, d, True)
 
     def to_dict(self):
         out = {}
@@ -148,65 +218,60 @@ class IndexBody(object):
             out['settings'] = self._settings
         if self._aliases:
             out['aliases'] = self._aliases
-        mappings, analysis = self._get_mappings()
-        if mappings:
+        mappings = self._mapping.to_dict() if self._mapping else {}
+        analysis = self._mapping._collect_analysis() if self._mapping else {}
+        for d in self._doc_types:
+            mapping = d._doc_type.mapping
+            merge(mappings, mapping.to_dict(), True)
+            merge(analysis, mapping._collect_analysis(), True)
+        if mappings and mappings[self._get_doc_type()]:
             out['mappings'] = mappings
         if analysis or self._analysis:
-            for key in self._analysis:
-                analysis.setdefault(key, {}).update(self._analysis[key])
+            merge(analysis, self._analysis)
             out.setdefault('settings', {})['analysis'] = analysis
         return out
 
-class IndexTemplate(IndexBody):
-    def __init__(self, name, template, **kwargs):
-        super(IndexTemplate, self).__init__(name, **kwargs)
-        self._template = template
-
-    def to_dict(self):
-        d = super(IndexTemplate, self).to_dict()
-        d['template'] = self._template
-        return d
-
-    def save(self):
-        self.connection.indices.put_template(name=self._name, body=self.to_dict())
-
-    def search(self):
+    def search(self, using=None):
         """
-        Return a :class:`~elasticsearch_dsl.Search` object searching over all
-        the indices belonging to this template and its ``DocType``\s.
+        Return a :class:`~elasticsearch_dsl.Search` object searching over the
+        index (or all the indices belonging to this template) and its
+        ``Document``\\s.
         """
         return Search(
-            using=self._using,
-            index=self._template,
-            doc_type=[self._doc_types.get(k, k) for k in self._mappings]
-        )
-
-class Index(IndexBody):
-    def search(self):
-        """
-        Return a :class:`~elasticsearch_dsl.Search` object searching over this
-        index and its ``DocType``\s.
-        """
-        return Search(
-            using=self._using,
+            using=using or self._using,
             index=self._name,
-            doc_type=[self._doc_types.get(k, k) for k in self._mappings]
+            doc_type=self._doc_types
         )
 
-    def create(self, **kwargs):
+    def updateByQuery(self, using=None):
+        """
+        Return a :class:`~elasticsearch_dsl.UpdateByQuery` object searching over the index
+        (or all the indices belonging to this template) and updating Documents that match
+        the search criteria.
+
+        For more information, see here:
+        https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-update-by-query.html
+        """
+        return UpdateByQuery(
+            using=using or self._using,
+            index=self._name,
+            doc_type=self._doc_types
+        )
+
+    def create(self, using=None, **kwargs):
         """
         Creates the index in elasticsearch.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.create`` unchanged.
         """
-        self.connection.indices.create(index=self._name, body=self.to_dict(), **kwargs)
+        self._get_connection(using).indices.create(index=self._name, body=self.to_dict(), **kwargs)
 
-    def is_closed(self):
-        state = self.connection.cluster.state(index=self._name, metric='metadata')
+    def is_closed(self, using=None):
+        state = self._get_connection(using).cluster.state(index=self._name, metric='metadata')
         return state['metadata']['indices'][self._name]['state'] == 'close'
 
-    def save(self):
+    def save(self, using=None):
         """
         Sync the index definition with elasticsearch, creating the index if it
         doesn't exist and updating its settings and mappings if it does.
@@ -215,21 +280,22 @@ class Index(IndexBody):
         index (or at all on an existing index) and for those this method will
         fail with the underlying exception.
         """
-        if not self.exists():
-            return self.create()
+        if not self.exists(using=using):
+            return self.create(using=using)
 
         body = self.to_dict()
         settings = body.pop('settings', {})
         analysis = settings.pop('analysis', None)
+        current_settings = self.get_settings(using=using)[self._name]['settings']['index']
         if analysis:
-            if self.is_closed():
+            if self.is_closed(using=using):
                 # closed index, update away
                 settings['analysis'] = analysis
             else:
                 # compare analysis definition, if all analysis objects are
                 # already defined as requested, skip analysis update and
                 # proceed, otherwise raise IllegalOperation
-                existing_analysis = self.get_settings()[self._name]['settings']['index'].get('analysis', {})
+                existing_analysis = current_settings.get('analysis', {})
                 if any(
                     existing_analysis.get(section, {}).get(k, None) != analysis[section][k]
                     for section in analysis
@@ -240,16 +306,22 @@ class Index(IndexBody):
 
         # try and update the settings
         if settings:
-            self.put_settings(body=settings)
+            settings = settings.copy()
+            for k, v in list(settings.items()):
+                if k in current_settings and current_settings[k] == str(v):
+                    del settings[k]
+
+            if settings:
+                self.put_settings(using=using, body=settings)
 
         # update the mappings, any conflict in the mappings will result in an
         # exception
         mappings = body.pop('mappings', {})
         if mappings:
             for doc_type in mappings:
-                self.put_mapping(doc_type=doc_type, body=mappings[doc_type])
+                self.put_mapping(using=using, doc_type=doc_type, body=mappings[doc_type])
 
-    def analyze(self, **kwargs):
+    def analyze(self, using=None, **kwargs):
         """
         Perform the analysis process on a text and return the tokens breakdown
         of the text.
@@ -257,171 +329,171 @@ class Index(IndexBody):
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.analyze`` unchanged.
         """
-        return self.connection.indices.analyze(index=self._name, **kwargs)
+        return self._get_connection(using).indices.analyze(index=self._name, **kwargs)
 
-    def refresh(self, **kwargs):
+    def refresh(self, using=None, **kwargs):
         """
         Preforms a refresh operation on the index.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.refresh`` unchanged.
         """
-        return self.connection.indices.refresh(index=self._name, **kwargs)
+        return self._get_connection(using).indices.refresh(index=self._name, **kwargs)
 
-    def flush(self, **kwargs):
+    def flush(self, using=None, **kwargs):
         """
         Preforms a flush operation on the index.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.flush`` unchanged.
         """
-        return self.connection.indices.flush(index=self._name, **kwargs)
+        return self._get_connection(using).indices.flush(index=self._name, **kwargs)
 
-    def get(self, **kwargs):
+    def get(self, using=None, **kwargs):
         """
         The get index API allows to retrieve information about the index.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.get`` unchanged.
         """
-        return self.connection.indices.get(index=self._name, **kwargs)
+        return self._get_connection(using).indices.get(index=self._name, **kwargs)
 
-    def open(self, **kwargs):
+    def open(self, using=None, **kwargs):
         """
         Opens the index in elasticsearch.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.open`` unchanged.
         """
-        return self.connection.indices.open(index=self._name, **kwargs)
+        return self._get_connection(using).indices.open(index=self._name, **kwargs)
 
-    def close(self, **kwargs):
+    def close(self, using=None, **kwargs):
         """
         Closes the index in elasticsearch.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.close`` unchanged.
         """
-        return self.connection.indices.close(index=self._name, **kwargs)
+        return self._get_connection(using).indices.close(index=self._name, **kwargs)
 
-    def delete(self, **kwargs):
+    def delete(self, using=None, **kwargs):
         """
         Deletes the index in elasticsearch.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.delete`` unchanged.
         """
-        return self.connection.indices.delete(index=self._name, **kwargs)
+        return self._get_connection(using).indices.delete(index=self._name, **kwargs)
 
-    def exists(self, **kwargs):
+    def exists(self, using=None, **kwargs):
         """
         Returns ``True`` if the index already exists in elasticsearch.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.exists`` unchanged.
         """
-        return self.connection.indices.exists(index=self._name, **kwargs)
+        return self._get_connection(using).indices.exists(index=self._name, **kwargs)
 
-    def exists_type(self, **kwargs):
+    def exists_type(self, using=None, **kwargs):
         """
         Check if a type/types exists in the index.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.exists_type`` unchanged.
         """
-        return self.connection.indices.exists_type(index=self._name, **kwargs)
+        return self._get_connection(using).indices.exists_type(index=self._name, **kwargs)
 
-    def put_mapping(self, **kwargs):
+    def put_mapping(self, using=None, **kwargs):
         """
         Register specific mapping definition for a specific type.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.put_mapping`` unchanged.
         """
-        return self.connection.indices.put_mapping(index=self._name, **kwargs)
+        return self._get_connection(using).indices.put_mapping(index=self._name, **kwargs)
 
-    def get_mapping(self, **kwargs):
+    def get_mapping(self, using=None, **kwargs):
         """
         Retrieve specific mapping definition for a specific type.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.get_mapping`` unchanged.
         """
-        return self.connection.indices.get_mapping(index=self._name, **kwargs)
+        return self._get_connection(using).indices.get_mapping(index=self._name, **kwargs)
 
-    def get_field_mapping(self, **kwargs):
+    def get_field_mapping(self, using=None, **kwargs):
         """
         Retrieve mapping definition of a specific field.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.get_field_mapping`` unchanged.
         """
-        return self.connection.indices.get_field_mapping(index=self._name, **kwargs)
+        return self._get_connection(using).indices.get_field_mapping(index=self._name, **kwargs)
 
-    def put_alias(self, **kwargs):
+    def put_alias(self, using=None, **kwargs):
         """
         Create an alias for the index.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.put_alias`` unchanged.
         """
-        return self.connection.indices.put_alias(index=self._name, **kwargs)
+        return self._get_connection(using).indices.put_alias(index=self._name, **kwargs)
 
-    def exists_alias(self, **kwargs):
+    def exists_alias(self, using=None, **kwargs):
         """
         Return a boolean indicating whether given alias exists for this index.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.exists_alias`` unchanged.
         """
-        return self.connection.indices.exists_alias(index=self._name, **kwargs)
+        return self._get_connection(using).indices.exists_alias(index=self._name, **kwargs)
 
-    def get_alias(self, **kwargs):
+    def get_alias(self, using=None, **kwargs):
         """
         Retrieve a specified alias.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.get_alias`` unchanged.
         """
-        return self.connection.indices.get_alias(index=self._name, **kwargs)
+        return self._get_connection(using).indices.get_alias(index=self._name, **kwargs)
 
-    def delete_alias(self, **kwargs):
+    def delete_alias(self, using=None, **kwargs):
         """
         Delete specific alias.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.delete_alias`` unchanged.
         """
-        return self.connection.indices.delete_alias(index=self._name, **kwargs)
+        return self._get_connection(using).indices.delete_alias(index=self._name, **kwargs)
 
-    def get_settings(self, **kwargs):
+    def get_settings(self, using=None, **kwargs):
         """
         Retrieve settings for the index.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.get_settings`` unchanged.
         """
-        return self.connection.indices.get_settings(index=self._name, **kwargs)
+        return self._get_connection(using).indices.get_settings(index=self._name, **kwargs)
 
-    def put_settings(self, **kwargs):
+    def put_settings(self, using=None, **kwargs):
         """
         Change specific index level settings in real time.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.put_settings`` unchanged.
         """
-        return self.connection.indices.put_settings(index=self._name, **kwargs)
+        return self._get_connection(using).indices.put_settings(index=self._name, **kwargs)
 
-    def stats(self, **kwargs):
+    def stats(self, using=None, **kwargs):
         """
         Retrieve statistics on different operations happening on the index.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.stats`` unchanged.
         """
-        return self.connection.indices.stats(index=self._name, **kwargs)
+        return self._get_connection(using).indices.stats(index=self._name, **kwargs)
 
-    def segments(self, **kwargs):
+    def segments(self, using=None, **kwargs):
         """
         Provide low level segments information that a Lucene index (shard
         level) is built with.
@@ -429,27 +501,27 @@ class Index(IndexBody):
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.segments`` unchanged.
         """
-        return self.connection.indices.segments(index=self._name, **kwargs)
+        return self._get_connection(using).indices.segments(index=self._name, **kwargs)
 
-    def validate_query(self, **kwargs):
+    def validate_query(self, using=None, **kwargs):
         """
         Validate a potentially expensive query without executing it.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.validate_query`` unchanged.
         """
-        return self.connection.indices.validate_query(index=self._name, **kwargs)
+        return self._get_connection(using).indices.validate_query(index=self._name, **kwargs)
 
-    def clear_cache(self, **kwargs):
+    def clear_cache(self, using=None, **kwargs):
         """
         Clear all caches or specific cached associated with the index.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.clear_cache`` unchanged.
         """
-        return self.connection.indices.clear_cache(index=self._name, **kwargs)
+        return self._get_connection(using).indices.clear_cache(index=self._name, **kwargs)
 
-    def recovery(self, **kwargs):
+    def recovery(self, using=None, **kwargs):
         """
         The indices recovery API provides insight into on-going shard
         recoveries for the index.
@@ -457,27 +529,27 @@ class Index(IndexBody):
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.recovery`` unchanged.
         """
-        return self.connection.indices.recovery(index=self._name, **kwargs)
+        return self._get_connection(using).indices.recovery(index=self._name, **kwargs)
 
-    def upgrade(self, **kwargs):
+    def upgrade(self, using=None, **kwargs):
         """
         Upgrade the index to the latest format.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.upgrade`` unchanged.
         """
-        return self.connection.indices.upgrade(index=self._name, **kwargs)
+        return self._get_connection(using).indices.upgrade(index=self._name, **kwargs)
 
-    def get_upgrade(self, **kwargs):
+    def get_upgrade(self, using=None, **kwargs):
         """
         Monitor how much of the index is upgraded.
 
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.get_upgrade`` unchanged.
         """
-        return self.connection.indices.get_upgrade(index=self._name, **kwargs)
+        return self._get_connection(using).indices.get_upgrade(index=self._name, **kwargs)
 
-    def flush_synced(self, **kwargs):
+    def flush_synced(self, using=None, **kwargs):
         """
         Perform a normal flush, then add a generated unique marker (sync_id) to
         all shards.
@@ -485,9 +557,9 @@ class Index(IndexBody):
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.flush_synced`` unchanged.
         """
-        return self.connection.indices.flush_synced(index=self._name, **kwargs)
+        return self._get_connection(using).indices.flush_synced(index=self._name, **kwargs)
 
-    def shard_stores(self, **kwargs):
+    def shard_stores(self, using=None, **kwargs):
         """
         Provides store information for shard copies of the index. Store
         information reports on which nodes shard copies exist, the shard copy
@@ -497,9 +569,9 @@ class Index(IndexBody):
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.shard_stores`` unchanged.
         """
-        return self.connection.indices.shard_stores(index=self._name, **kwargs)
+        return self._get_connection(using).indices.shard_stores(index=self._name, **kwargs)
 
-    def forcemerge(self, **kwargs):
+    def forcemerge(self, using=None, **kwargs):
         """
         The force merge API allows to force merging of the index through an
         API. The merge relates to the number of segments a Lucene index holds
@@ -513,9 +585,9 @@ class Index(IndexBody):
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.forcemerge`` unchanged.
         """
-        return self.connection.indices.forcemerge(index=self._name, **kwargs)
+        return self._get_connection(using).indices.forcemerge(index=self._name, **kwargs)
 
-    def shrink(self, **kwargs):
+    def shrink(self, using=None, **kwargs):
         """
         The shrink index API allows you to shrink an existing index into a new
         index with fewer primary shards. The number of primary shards in the
@@ -530,4 +602,4 @@ class Index(IndexBody):
         Any additional keyword arguments will be passed to
         ``Elasticsearch.indices.shrink`` unchanged.
         """
-        return self.connection.indices.shrink(index=self._name, **kwargs)
+        return self._get_connection(using).indices.shrink(index=self._name, **kwargs)

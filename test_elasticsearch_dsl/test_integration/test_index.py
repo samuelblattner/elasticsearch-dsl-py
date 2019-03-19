@@ -1,12 +1,12 @@
-from elasticsearch_dsl import DocType, Index, Text, Keyword, Date, analysis, IndexTemplate
+from elasticsearch_dsl import Document, Index, Text, Keyword, Date, analysis, IndexTemplate
 
-class Post(DocType):
+class Post(Document):
     title = Text(analyzer=analysis.analyzer('my_analyzer', tokenizer='keyword'))
     published_from = Date()
 
 def test_index_template_works(write_client):
     it = IndexTemplate('test-template', 'test-*')
-    it.doc_type(Post)
+    it.document(Post)
     it.settings(number_of_replicas=0, number_of_shards=1)
     it.save()
 
@@ -26,6 +26,14 @@ def test_index_template_works(write_client):
         }
     } == write_client.indices.get_mapping(index='test-blog')
 
+def test_index_can_be_saved_even_with_settings(write_client):
+    i = Index('test-blog', using=write_client)
+    i.settings(number_of_shards=3, number_of_replicas=0)
+    i.save()
+    i.settings(number_of_replicas=1)
+    i.save()
+
+    assert '1' == i.get_settings()['test-blog']['settings']['index']['number_of_replicas']
 
 def test_index_exists(data_client):
     assert Index('git').exists()
@@ -33,7 +41,7 @@ def test_index_exists(data_client):
 
 def test_index_can_be_created_with_settings_and_mappings(write_client):
     i = Index('test-blog', using=write_client)
-    i.doc_type(Post)
+    i.document(Post)
     i.settings(number_of_replicas=0, number_of_shards=1)
     i.create()
 
@@ -77,7 +85,7 @@ def test_multiple_indices_with_same_doc_type_work(write_client):
     i2 = Index('test-index-2', using=write_client)
 
     for i in (i1, i2):
-        i.doc_type(Post)
+        i.document(Post)
         i.create()
 
     for i in ('test-index-1', 'test-index-2'):

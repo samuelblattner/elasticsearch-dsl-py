@@ -5,7 +5,17 @@ from dateutil import tz
 
 import pytest
 
-from elasticsearch_dsl import field
+from elasticsearch_dsl import field, InnerDoc, ValidationException, Range
+
+def test_date_range_deserialization():
+    data = {
+        'lt': '2018-01-01T00:30:10'
+    }
+
+    r = field.DateRange().deserialize(data)
+
+    assert isinstance(r, Range)
+    assert r.lt == datetime(2018, 1, 1, 0, 30, 10)
 
 def test_boolean_deserialization():
     bf = field.Boolean()
@@ -134,3 +144,35 @@ def test_binary():
     assert f.deserialize(base64.b64encode(b'42')) == b'42'
     assert f.deserialize(f.serialize(b'42')) == b'42'
     assert f.deserialize(None) is None
+
+
+def test_object_dynamic_values():
+    for dynamic in True, False, 'strict':
+        f = field.Object(dynamic=dynamic)
+        assert f.to_dict()['dynamic'] == dynamic
+
+def test_object_disabled():
+    f = field.Object(enabled=False)
+    assert f.to_dict() == {
+        "type": "object",
+        "enabled": False
+    }
+
+
+def test_object_constructor():
+    expected = {'type': 'object', 'properties': {'inner_int': {'type': 'integer'}}}
+
+    class Inner(InnerDoc):
+        inner_int = field.Integer()
+
+    obj_from_doc = field.Object(doc_class=Inner)
+    assert obj_from_doc.to_dict() == expected
+
+    obj_from_props = field.Object(properties={'inner_int': field.Integer()})
+    assert obj_from_props.to_dict() == expected
+
+    with pytest.raises(ValidationException):
+        field.Object(doc_class=Inner, properties={'inner_int': field.Integer()})
+
+    with pytest.raises(ValidationException):
+        field.Object(doc_class=Inner, dynamic=False)

@@ -1,13 +1,14 @@
-import collections
+try:
+    import collections.abc as collections_abc  # only works on python 3.3+
+except ImportError:
+    import collections as collections_abc
 
 from six import iteritems, itervalues
 from itertools import chain
 
 from .utils import DslBase
-from .field import Text, construct_field
+from .field import Text, construct_field, Nested
 from .connections import connections
-from .exceptions import IllegalOperation
-from .index import Index
 
 META_FIELDS = frozenset((
     'dynamic', 'transform', 'dynamic_date_formats', 'date_detection',
@@ -72,11 +73,29 @@ class Mapping(object):
     def __repr__(self):
         return 'Mapping(%r)' % self.doc_type
 
+    def _clone(self):
+        m = Mapping(self.properties.name)
+        m.properties._params = self.properties._params.copy()
+        return m
+
     @classmethod
     def from_es(cls, index, doc_type, using='default'):
         m = cls(doc_type)
         m.update_from_es(index, using)
         return m
+
+    def resolve_nested(self, field_path):
+        field = self
+        nested = []
+        parts = field_path.split('.')
+        for i, step in enumerate(parts):
+            try:
+                field = field[step]
+            except KeyError:
+                return (), None
+            if isinstance(field, Nested):
+                nested.append('.'.join(parts[:i+1]))
+        return nested, field
 
     def resolve_field(self, field_path):
         field = self
@@ -111,7 +130,8 @@ class Mapping(object):
         return analysis
 
     def save(self, index, using='default'):
-        index = Index(index, using=using)
+        from .index import Index
+        index = Index(index, doc_type=self.doc_type, using=using)
         index.mapping(self)
         return index.save()
 
@@ -119,15 +139,17 @@ class Mapping(object):
         es = connections.get_connection(using)
         raw = es.indices.get_mapping(index=index, doc_type=self.doc_type)
         _, raw = raw.popitem()
-        raw = raw['mappings'][self.doc_type]
+        self._update_from_dict(raw['mappings'])
 
-        for name, definition in iteritems(raw['properties']):
+    def _update_from_dict(self, raw):
+        raw = raw[self.doc_type]
+        for name, definition in iteritems(raw.get('properties', {})):
             self.field(name, definition)
 
         # metadata like _all etc
         for name, value in iteritems(raw):
             if name != 'properties':
-                if isinstance(value, collections.Mapping):
+                if isinstance(value, collections_abc.Mapping):
                     self.meta(name, **value)
                 else:
                     self.meta(name, value)

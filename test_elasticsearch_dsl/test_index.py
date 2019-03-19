@@ -1,13 +1,55 @@
-from elasticsearch_dsl import DocType, Index, Text, Date, analyzer
+from elasticsearch_dsl import Document, Index, Text, Date, analyzer, Mapping, \
+    exceptions
 
 from random import choice
-
 import string
 
-class Post(DocType):
+from pytest import raises
+
+class Post(Document):
     title = Text()
     published_from = Date()
 
+def test_doc_type_can_be_set():
+    i = Index('i', doc_type='t')
+    m = Mapping('t')
+    m.field('title', Text())
+    i.mapping(m)
+
+    assert {
+        'mappings': {
+            't': {
+                'properties': {
+                    'title': {'type': 'text'}
+                }
+            }
+        }
+    } == i.to_dict()
+
+def test_conflicting_doc_types_cause_exception():
+    i = Index('i', doc_type='t')
+
+    with raises(exceptions.IllegalOperation):
+        i.document(Post)
+
+def test_multiple_doc_types_will_combine_mappings():
+    class User(Document):
+        username = Text()
+
+    i = Index('i')
+    i.document(Post)
+    i.document(User)
+    assert {
+        'mappings': {
+            'doc': {
+                'properties': {
+                    'title': {'type': 'text'},
+                    'username': {'type': 'text'},
+                    'published_from': {'type': 'date'}
+                }
+            }
+        }
+    } == i.to_dict()
 
 def test_search_is_limited_to_index_name():
     i = Index('my-index')
@@ -59,9 +101,8 @@ def test_settings_are_saved():
 
 def test_registered_doc_type_included_in_to_dict():
     i = Index('i', using='alias')
-    i.doc_type(Post)
+    i.document(Post)
 
-    assert Post._doc_type.index == 'i'
     assert {
         'mappings': {
             'doc': {
@@ -75,7 +116,7 @@ def test_registered_doc_type_included_in_to_dict():
 
 def test_registered_doc_type_included_in_search():
     i = Index('i', using='alias')
-    i.doc_type(Post)
+    i.document(Post)
 
     s = i.search()
 
@@ -119,3 +160,10 @@ def test_analyzers_returned_from_to_dict():
     index.analyzer(random_analyzer)
 
     assert index.to_dict()["settings"]["analysis"]["analyzer"][random_analyzer_name] == {"filter": ["standard"], "type": "custom", "tokenizer": "standard"}
+
+def test_conflicting_analyzer_raises_error():
+    i = Index('i')
+    i.analyzer('my_analyzer', tokenizer='whitespace', filter=['lowercase', 'stop'])
+
+    with raises(ValueError):
+        i.analyzer('my_analyzer', tokenizer='keyword', filter=['lowercase', 'stop'])
