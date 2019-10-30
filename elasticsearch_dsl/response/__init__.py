@@ -1,4 +1,4 @@
-from ..utils import AttrDict, AttrList
+from ..utils import AttrDict, AttrList, _wrap
 
 from .hit import Hit, HitMeta
 
@@ -28,7 +28,7 @@ class Response(AttrDict):
         return len(self.hits)
 
     def __getstate__(self):
-        return (self._d_, self._search, self._doc_class)
+        return self._d_, self._search, self._doc_class
 
     def __setstate__(self, state):
         super(AttrDict, self).__setattr__('_d_', state[0])
@@ -52,7 +52,7 @@ class Response(AttrDict):
             # avoid assigning _hits into self._d_
             super(AttrDict, self).__setattr__('_hits', hits)
             for k in h:
-                setattr(self._hits, k, h[k])
+                setattr(self._hits, k, _wrap(h[k]))
         return self._hits
 
     @property

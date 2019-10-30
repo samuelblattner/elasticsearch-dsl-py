@@ -3,12 +3,13 @@ try:
 except ImportError:
     import collections as collections_abc
 
-from six import iteritems, itervalues
 from itertools import chain
 
+from six import iteritems, itervalues
+
+from .connections import get_connection
+from .field import Nested, Text, construct_field
 from .utils import DslBase
-from .field import Text, construct_field, Nested
-from .connections import connections
 
 META_FIELDS = frozenset((
     'dynamic', 'transform', 'dynamic_date_formats', 'date_detection',
@@ -16,13 +17,13 @@ META_FIELDS = frozenset((
 ))
 
 class Properties(DslBase):
+    name = 'properties'
     _param_defs = {'properties': {'type': 'field', 'hash': True}}
-    def __init__(self, name):
-        self._name = name
+    def __init__(self):
         super(Properties, self).__init__()
 
     def __repr__(self):
-        return 'Properties(%r)' % self._name
+        return 'Properties()'
 
     def __getitem__(self, name):
         return self.properties[name]
@@ -30,16 +31,15 @@ class Properties(DslBase):
     def __contains__(self, name):
         return name in self.properties
 
-    @property
-    def name(self):
-        return self._name
+    def to_dict(self):
+        return super(Properties, self).to_dict()['properties']
 
     def field(self, name, *args, **kwargs):
         self.properties[name] = construct_field(*args, **kwargs)
         return self
 
     def _collect_fields(self):
-        " Iterate over all Field objects within, including multi fields. "
+        """ Iterate over all Field objects within, including multi fields. """
         for f in itervalues(self.properties.to_dict()):
             yield f
             # multi fields
@@ -66,21 +66,21 @@ class Properties(DslBase):
 
 
 class Mapping(object):
-    def __init__(self, name):
-        self.properties = Properties(name)
+    def __init__(self):
+        self.properties = Properties()
         self._meta = {}
 
     def __repr__(self):
-        return 'Mapping(%r)' % self.doc_type
+        return 'Mapping()'
 
     def _clone(self):
-        m = Mapping(self.properties.name)
+        m = Mapping()
         m.properties._params = self.properties._params.copy()
         return m
 
     @classmethod
-    def from_es(cls, index, doc_type, using='default'):
-        m = cls(doc_type)
+    def from_es(cls, index, using='default'):
+        m = cls()
         m.update_from_es(index, using)
         return m
 
@@ -131,18 +131,17 @@ class Mapping(object):
 
     def save(self, index, using='default'):
         from .index import Index
-        index = Index(index, doc_type=self.doc_type, using=using)
+        index = Index(index, using=using)
         index.mapping(self)
         return index.save()
 
     def update_from_es(self, index, using='default'):
-        es = connections.get_connection(using)
-        raw = es.indices.get_mapping(index=index, doc_type=self.doc_type)
+        es = get_connection(using)
+        raw = es.indices.get_mapping(index=index)
         _, raw = raw.popitem()
         self._update_from_dict(raw['mappings'])
 
     def _update_from_dict(self, raw):
-        raw = raw[self.doc_type]
         for name, definition in iteritems(raw.get('properties', {})):
             self.field(name, definition)
 
@@ -159,7 +158,8 @@ class Mapping(object):
             if update_only and name in self:
                 # nested and inner objects, merge recursively
                 if hasattr(self[name], 'update'):
-                    self[name].update(mapping[name])
+                    # FIXME only merge subfields, not the settings
+                    self[name].update(mapping[name], update_only)
                 continue
             self.field(name, mapping[name])
 
@@ -179,10 +179,6 @@ class Mapping(object):
     def __iter__(self):
         return iter(self.properties.properties)
 
-    @property
-    def doc_type(self):
-        return self.properties.name
-
     def field(self, *args, **kwargs):
         self.properties.field(*args, **kwargs)
         return self
@@ -198,7 +194,6 @@ class Mapping(object):
         return self
 
     def to_dict(self):
-        d = self.properties.to_dict()
         meta = self._meta
 
         # hard coded serialization of analyzers in _all
@@ -208,5 +203,5 @@ class Mapping(object):
             for f in ('analyzer', 'search_analyzer', 'search_quote_analyzer'):
                 if hasattr(_all.get(f, None), 'to_dict'):
                     _all[f] = _all[f].to_dict()
-        d[self.doc_type].update(meta)
-        return d
+        meta.update(self.properties.to_dict())
+        return meta

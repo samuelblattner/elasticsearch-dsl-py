@@ -3,6 +3,33 @@
 Changelog
 =========
 
+7.1.0 (2019-10-23)
+------------------
+
+* Optimistic concurrent control for Document.delete
+* Removing deprecated ``DocType``
+* Proper count caching for ES 7.x
+* Support for ``multiplexer`` token filter
+* Don't substitute for ``__`` in ``FacetedSearch``
+
+7.0.0 (2019-04-26)
+------------------
+
+* Compatibility with Elasticsearch 7.x
+* ``Document.save()`` now returns ``"created"`` or ``"updated"``
+* Dropped support for Python 2.6, 3.2, and 3.3
+* When using ``fields`` the values are no longer merged into the body of the
+  document and have to be accessed via ``.meta.fields`` only
+
+6.4.0 (2019-04-26)
+------------------
+
+* ``Index.document`` now correctly sets the ``Document``'s ``_index`` only when
+  using default index (``#1091``)
+* ``Document`` inheritance allows overriding ``Object`` and ``Nested`` field metadata like ``dynamic``
+* adding ``auto_date_histogram`` aggregation
+* Do not change data in place when (de)serializing
+
 6.3.1 (2018-12-05)
 ------------------
 

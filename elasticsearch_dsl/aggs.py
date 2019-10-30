@@ -153,6 +153,9 @@ class Filters(Bucket):
 class Children(Bucket):
     name = 'children'
 
+class Parent(Bucket):
+    name = 'parent'
+
 class DateHistogram(Bucket):
     name = 'date_histogram'
 
@@ -292,6 +295,9 @@ class MaxBucket(Pipeline):
 
 class MinBucket(Pipeline):
     name = 'min_bucket'
+
+class MovingFn(Pipeline):
+    name = 'moving_fn'
 
 class MovingAvg(Pipeline):
     name = 'moving_avg'

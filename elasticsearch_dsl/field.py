@@ -9,7 +9,7 @@ except ImportError:
 from datetime import date, datetime
 
 from dateutil import parser, tz
-from six import string_types, iteritems
+from six import string_types, iteritems, integer_types
 from six.moves import map
 
 from .query import Q
@@ -84,11 +84,8 @@ class Field(DslBase):
         return self._serialize(data)
 
     def deserialize(self, data):
-        if isinstance(data, tuple):
-            data = list(data)
-
-        if isinstance(data, (list, AttrList)):
-            data[:] = [
+        if isinstance(data, (list, AttrList, tuple)):
+            data = [
                 None if d is None else self._deserialize(d)
                 for d in data
             ]
@@ -176,7 +173,6 @@ class Object(Field):
 
     def to_dict(self):
         d = self._mapping.to_dict()
-        _, d = d.popitem()
         d.update(super(Object, self).to_dict())
         return d
 
@@ -214,12 +210,12 @@ class Object(Field):
             data.full_clean()
         return data
 
-    def update(self, other):
+    def update(self, other, update_only=False):
         if not isinstance(other, Object):
             # not an inner/nested object, no merge possible
             return
 
-        self._mapping.update(other._mapping)
+        self._mapping.update(other._mapping, update_only)
 
 class Nested(Object):
     name = 'nested'
@@ -255,7 +251,7 @@ class Date(Field):
             return data
         if isinstance(data, date):
             return data
-        if isinstance(data, int):
+        if isinstance(data, integer_types):
             # Divide by a float to preserve milliseconds on the datetime.
             return datetime.utcfromtimestamp(data / 1000.0)
 
@@ -313,6 +309,9 @@ class ScaledFloat(Float):
 class Double(Float):
     name = 'double'
 
+class RankFeature(Float):
+    name = 'rank_feature'
+
 class Integer(Field):
     name = 'integer'
     _coerce = True
@@ -334,7 +333,7 @@ class Ip(Field):
     _coerce = True
 
     def _deserialize(self, data):
-        # the ipaddress library for pypy, python2.5 and 2.6 only accepts unicode.
+        # the ipaddress library for pypy only accepts unicode.
         return ipaddress.ip_address(unicode(data))
 
     def _serialize(self, data):
