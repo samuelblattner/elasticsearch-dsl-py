@@ -266,6 +266,14 @@ class Text(Field):
     }
     name = 'text'
 
+class SearchAsYouType(Field):
+    _param_defs = {
+        'analyzer': {'type': 'analyzer'},
+        'search_analyzer': {'type': 'analyzer'},
+        'search_quote_analyzer': {'type': 'analyzer'},
+    }
+    name = 'search_as_you_type'
+
 class Keyword(Field):
     _param_defs = {
         'fields': {'type': 'field', 'hash': True},
@@ -296,6 +304,16 @@ class Float(Field):
 
     def _deserialize(self, data):
         return float(data)
+
+class DenseVector(Float):
+    name = 'dense_vector'
+
+    def __init__(self, dims, **kwargs):
+        kwargs["multi"] = True
+        super(DenseVector, self).__init__(dims=dims, **kwargs)
+
+class SparseVector(Field):
+    name = 'sparse_vector'
 
 class HalfFloat(Float):
     name = 'half_float'
@@ -414,7 +432,7 @@ class LongRange(RangeField):
     _core_field = Long()
 
 class DoubleRange(RangeField):
-    name = 'double_ranged'
+    name = 'double_range'
     _core_field = Double()
 
 class DateRange(RangeField):
